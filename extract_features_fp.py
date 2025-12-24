@@ -6,6 +6,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import timm
+from torchvision import transforms
 from timm.data import resolve_data_config, create_transform
 from timm.layers import SwiGLUPacked
 from torch.utils.data import DataLoader
@@ -42,8 +43,8 @@ def compute_w_loader(output_path, loader, model, model_name, verbose=0):
                     class_token = output[:, 0]
                     patch_tokens = output[:, 1:]
                     features = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
-                elif model_name == 'uni_v1' or model_name == 'UNI':
-                    # UNI 官方输出已经是 [B, 1024]，直接使用即可
+                elif model_name in ['uni_v1', 'UNI', 'h-optimus-0']:
+                    # UNI 和 H-optimus-0 官方输出直接就是 [B, 1024/1536]
                     features = output
                 elif model_name == 'Prov-GigaPath':
                     features = output[:, 0] if len(output.shape) == 3 else output
@@ -120,6 +121,32 @@ def load_uni():
     return model, img_transforms
 
 
+def load_h_optimus():
+    print("Loading Bioptimus H-optimus-0 using Official Configuration...")
+    # 按照官方文档：必须传 init_values=1e-5
+    model = timm.create_model(
+        "hf-hub:bioptimus/H-optimus-0",
+        pretrained=True,
+        init_values=1e-5,
+        dynamic_img_size=False
+    )
+    model = model.to(device)
+    model.eval()
+
+    # 官方文档指定的特定归一化参数，这对于病理图像特征的准确性至关重要
+    img_transforms = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.707223, 0.578729, 0.703617),
+            std=(0.211883, 0.230117, 0.177517)
+        ),
+    ])
+
+    print("H-optimus-0 model and transforms initialized successfully.")
+    return model, img_transforms
+
 
 
 parser = argparse.ArgumentParser(description='Feature Extraction')
@@ -130,7 +157,7 @@ parser.add_argument('--csv_path', type=str, default=None)
 parser.add_argument('--feat_dir', type=str, default=None)
 # 增加 virchow 选项
 parser.add_argument('--model_name', type=str, default='resnet50_trunc',
-                    choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'virchow','Prov-GigaPath'])
+                    choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'virchow','Prov-GigaPath','h-optimus-0'])
 parser.add_argument('--batch_size', type=int, default=128)  # 建议先从 128 开始试
 parser.add_argument('--no_auto_skip', default=False, action='store_true')
 parser.add_argument('--target_patch_size', type=int, default=224)
@@ -152,6 +179,8 @@ if __name__ == '__main__':
         model, img_transforms = load_virchow()
     elif args.model_name == 'Prov-GigaPath':
         model, img_transforms = load_prov_giga_path()
+    elif args.model_name == 'h-optimus-0':
+        model, img_transforms = load_h_optimus()
     elif args.model_name == 'uni_v1' or args.model_name == 'UNI':
         model, img_transforms = load_uni()
     else:
