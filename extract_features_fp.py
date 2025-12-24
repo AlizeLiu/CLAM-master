@@ -24,7 +24,7 @@ from timm.models import create_model
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 
-def compute_w_loader(output_path, loader, model, verbose=0):
+def compute_w_loader(output_path, loader, model, model_name, verbose=0):
     if verbose > 0:
         print(f'processing a total of {len(loader)} batches')
 
@@ -34,22 +34,26 @@ def compute_w_loader(output_path, loader, model, verbose=0):
             batch = data['img'].to(device, non_blocking=True)
             coords = data['coord'].numpy().astype(np.int32)
 
-            # 官方强烈建议使用 fp16 混合精度
             with torch.autocast(device_type='cuda', dtype=torch.float16):
-                output = model(batch)  # size: B x 257 x 1280
+                output = model(batch)
 
-                class_token = output[:, 0]  # B x 1280
-                patch_tokens = output[:, 1:]  # B x 256 x 1280
+                if model_name == 'virchow':
+                    # Virchow 特殊处理 (2560维)
+                    class_token = output[:, 0]
+                    patch_tokens = output[:, 1:]
+                    features = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
+                elif model_name == 'uni_v1' or model_name == 'UNI':
+                    # UNI 官方输出已经是 [B, 1024]，直接使用即可
+                    features = output
+                elif model_name == 'Prov-GigaPath':
+                    features = output[:, 0] if len(output.shape) == 3 else output
+                else:
+                    features = output
 
-                # 拼接得到 2560 维嵌入
-                features = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
-
-            # 转换为 fp32 保存到 h5
             features = features.cpu().numpy().astype(np.float32)
             asset_dict = {'features': features, 'coords': coords}
             save_hdf5(output_path, asset_dict, attr_dict=None, mode=mode)
             mode = 'a'
-
     return output_path
 
 
@@ -74,8 +78,46 @@ def load_virchow():
     print("Virchow model and transforms initialized successfully.")
     return model, img_transforms
 
+
 def load_prov_giga_path():
     print("Loading Prov-GigaPath using Official Configuration...")
+    # Gigapath 的架构是巨大的，本质上是 ViT-Giant (patch 14)
+    # 官方模型 ID  "hf_hub:prov-gigapath/prov-gigapath"
+    model = timm.create_model(
+        "hf_hub:prov-gigapath/prov-gigapath",
+        pretrained=True
+    )
+
+    model = model.to(device)
+    model.eval()
+
+    # Gigapath 的标准预处理：224x224, ImageNet 归一化
+    config = resolve_data_config(model.pretrained_cfg, model=model)
+    img_transforms = create_transform(**config)
+
+    print("Prov-GigaPath model and transforms initialized successfully.")
+    return model, img_transforms
+
+def load_uni():
+    print("Loading MahmoodLab UNI using Official Configuration...")
+    # 按照官方文档：必须传 init_values=1e-5 才能正确加载 LayerScale 参数
+    # dynamic_img_size=True 允许处理略微偏离 224 的尺寸
+    model = timm.create_model(
+        "hf-hub:MahmoodLab/uni",
+        pretrained=True,
+        init_values=1e-5,
+        dynamic_img_size=True
+    )
+    model = model.to(device)
+    model.eval()
+
+    # 使用官方推荐的 resolve_data_config 方式获取 transforms
+    config = resolve_data_config(model.pretrained_cfg, model=model)
+    img_transforms = create_transform(**config)
+
+    print("UNI model and transforms initialized successfully.")
+    # UNI 的特征维度是 1024
+    return model, img_transforms
 
 
 
@@ -108,6 +150,10 @@ if __name__ == '__main__':
     # 根据选择加载模型
     if args.model_name == 'virchow':
         model, img_transforms = load_virchow()
+    elif args.model_name == 'Prov-GigaPath':
+        model, img_transforms = load_prov_giga_path()
+    elif args.model_name == 'uni_v1' or args.model_name == 'UNI':
+        model, img_transforms = load_uni()
     else:
         from models import get_encoder
 
@@ -133,7 +179,7 @@ if __name__ == '__main__':
         dataset = Whole_Slide_Bag_FP(file_path=h5_file_path, wsi=wsi, img_transforms=img_transforms)
 
         loader = DataLoader(dataset=dataset, batch_size=args.batch_size, **loader_kwargs)
-        output_file_path = compute_w_loader(output_path, loader=loader, model=model, verbose=1)
+        output_file_path = compute_w_loader(output_path, loader=loader,model_name=args.model_name, model=model, verbose=1)
 
         # 将 h5 转换为 CLAM 需要的 pt 文件
         with h5py.File(output_file_path, "r") as file:

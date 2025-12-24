@@ -40,6 +40,6 @@ def read_all_datasets(file_path, max_preview=50):
 
 
 # 替换为你的 HDF5 文件路径
-h5_file_path = r"J:\Work\CLAM-master\toy_test\fearure_v\h5_files\true_215209_F1001397_001.h5"
+h5_file_path = r"J:\Work\CLAM-master\toy_test\feature_uni\h5_files\true_215209_F1001397_001.h5"
 read_all_datasets(h5_file_path)
 
