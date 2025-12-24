@@ -1,0 +1,4 @@
+toy_example/
+toy_test/
+*.svs
+*.pth
