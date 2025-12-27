@@ -168,13 +168,15 @@ if __name__ == '__main__':
     if args.csv_path is None:
         raise NotImplementedError
 
+    # 1. 初始化数据集
     bags_dataset = Dataset_All_Bags(args.csv_path)
+
+    # 2. 建立文件夹
     os.makedirs(args.feat_dir, exist_ok=True)
     os.makedirs(os.path.join(args.feat_dir, 'pt_files'), exist_ok=True)
     os.makedirs(os.path.join(args.feat_dir, 'h5_files'), exist_ok=True)
-    dest_files = os.listdir(os.path.join(args.feat_dir, 'pt_files'))
 
-    # 根据选择加载模型
+    # 3. 加载模型
     if args.model_name == 'virchow':
         model, img_transforms = load_virchow()
     elif args.model_name == 'Prov-GigaPath':
@@ -193,28 +195,61 @@ if __name__ == '__main__':
     total = len(bags_dataset)
     loader_kwargs = {'num_workers': 0, 'pin_memory': True} if device.type == "cuda" else {}
 
+    # --- 计数器逻辑 ---
+    processed_count = 0
+    max_per_run = 80  # 设定本次运行处理的上限
+    # -----------------
+
+    print(f"开始特征提取任务，目标处理: {max_per_run} 张切片")
+
     for bag_candidate_idx in tqdm(range(total)):
+        # 获取当前切片的 ID
         slide_id = bags_dataset[bag_candidate_idx].split(args.slide_ext)[0]
+
+        # 检查是否已经存在（断点续传）
+        dest_files = os.listdir(os.path.join(args.feat_dir, 'pt_files'))
+        if not args.no_auto_skip and (slide_id + '.pt' in dest_files):
+            # 如果已经跑过了，直接跳过，不计入 processed_count
+            continue
+
+        # 如果已经处理够了 80 张新的，就跳出循环退出程序
+        if processed_count >= max_per_run:
+            print(f"\n已完成本次设定的 {max_per_run} 张任务，正在安全关闭...")
+            break
+
+        # 开始处理当前的切片
         bag_name = slide_id + '.h5'
         h5_file_path = os.path.join(args.data_h5_dir, 'patches', bag_name)
         slide_file_path = os.path.join(args.data_slide_dir, slide_id + args.slide_ext)
 
-        if not args.no_auto_skip and slide_id + '.pt' in dest_files:
-            continue
-
         output_path = os.path.join(args.feat_dir, 'h5_files', bag_name)
         time_start = time.time()
-        wsi = openslide.open_slide(slide_file_path)
-        dataset = Whole_Slide_Bag_FP(file_path=h5_file_path, wsi=wsi, img_transforms=img_transforms)
 
-        loader = DataLoader(dataset=dataset, batch_size=args.batch_size, **loader_kwargs)
-        output_file_path = compute_w_loader(output_path, loader=loader,model_name=args.model_name, model=model, verbose=1)
+        try:
+            wsi = openslide.open_slide(slide_file_path)
+            dataset = Whole_Slide_Bag_FP(file_path=h5_file_path, wsi=wsi, img_transforms=img_transforms)
+            loader = DataLoader(dataset=dataset, batch_size=args.batch_size, **loader_kwargs)
 
-        # 将 h5 转换为 CLAM 需要的 pt 文件
-        with h5py.File(output_file_path, "r") as file:
-            features = file['features'][:]
+            # 提取特征
+            output_file_path = compute_w_loader(output_path, loader=loader, model_name=args.model_name, model=model,
+                                                verbose=1)
 
-        features = torch.from_numpy(features)
-        torch.save(features, os.path.join(args.feat_dir, 'pt_files', slide_id + '.pt'))
+            # 将 h5 转换为 pt
+            with h5py.File(output_file_path, "r") as file:
+                features = file['features'][:]
+            features = torch.from_numpy(features)
+            torch.save(features, os.path.join(args.feat_dir, 'pt_files', slide_id + '.pt'))
 
-        print('\nSlide {} processed. Feature shape: {}'.format(slide_id, features.shape))
+            # 成功处理完一张，计数器加 1
+            processed_count += 1
+            time_elapsed = time.time() - time_start
+            print(f'\nProgress: {processed_count}/{max_per_run} | Slide {slide_id} took {time_elapsed:.2f}s')
+
+            # 每张跑完清空一下显存缓存
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"处理切片 {slide_id} 时出错: {e}")
+            continue
+
+    print(f"本次任务结束。共新处理切片: {processed_count} 张。")
