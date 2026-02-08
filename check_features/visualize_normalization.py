@@ -94,47 +94,40 @@ def visualize_patches(slide_path, h5_path, target_ref_path, output_dir, num_samp
         patch_level = f['coords'].attrs.get('patch_level', 0)
         h5_patch_size = f['coords'].attrs.get('patch_size', 256)
 
-    print(f"切片 {slide_name} 共有 {len(coords)} 个 patch，正在寻找 {num_samples} 个完美组织块...")
+    if len(coords) < num_samples:
+        print(f"可用 patch 数量不足 {num_samples}，仅随机抽取 {len(coords)} 个。")
+        num_samples = len(coords)
 
+    print(f"切片 {slide_name} 共有 {len(coords)} 个 patch，随机抽取 {num_samples} 个进行展示...")
+
+    indices = np.random.choice(len(coords), num_samples, replace=False)
     valid_samples = []
-    max_attempts = 1000  # 增加尝试次数
 
-    # 随机打乱
-    all_indices = np.random.permutation(len(coords))
-    pbar = tqdm(total=num_samples, desc="Searching")
-
-    for idx in all_indices:
-        if len(valid_samples) >= num_samples:
-            break
-
+    for idx in indices:
         coord = coords[idx]
         try:
-            # 读取 (此时是 256x256)
-            img_pil = wsi.read_region(tuple(coord), patch_level, (int(h5_patch_size), int(h5_patch_size))).convert(
-                'RGB')
-
-            # 处理 (内部会 resize 到 224)
+            img_pil = wsi.read_region(tuple(coord), patch_level, (int(h5_patch_size), int(h5_patch_size))).convert('RGB')
+            img_pil = img_pil.resize((224, 224))
             norm_pil, success = normalizer.process(img_pil)
-
-            if success:
-                valid_samples.append({'orig': img_pil.resize((224, 224)), 'norm': norm_pil})
-                pbar.update(1)
-        except:
+            # 始终保留这 5 个随机样本，标准化失败则用原图兜底
+            valid_samples.append({'orig': img_pil, 'norm': norm_pil if success else img_pil})
+        except Exception as e:
+            print(f"读取或处理 patch 失败: {e}")
+            valid_samples.append({'orig': img_pil if 'img_pil' in locals() else None, 'norm': img_pil if 'img_pil' in locals() else None})
             continue
 
-    pbar.close()
-
     if len(valid_samples) == 0:
-        print("\n❌ 错误：未找到任何符合条件的 Patch。")
+        print("\n❌ 错误：未找到任何可用的 Patch。")
         return
 
-    print(f"\n✅ 找到 {len(valid_samples)} 个高质量样本，正在绘图...")
+    print(f"\n✅ 随机抽取到 {len(valid_samples)} 个样本，正在绘图...")
 
     # --- 绘图 ---
     fig, axes = plt.subplots(len(valid_samples), 5, figsize=(16, 3.5 * len(valid_samples)))
     plt.subplots_adjust(hspace=0.4, wspace=0.2)
 
-    if len(valid_samples) == 1: axes = [axes]
+    if len(valid_samples) == 1:
+        axes = [axes]
 
     for i, item in enumerate(valid_samples):
         orig = item['orig']

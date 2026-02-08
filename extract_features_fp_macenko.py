@@ -29,7 +29,8 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 class StainNormTransform(object):
     """
-    Macenko 染色标准化 Transform (修复 MKL 崩溃版)
+    Macenko 染色标准化 Transform (最终维度修复版)
+    集成: 强制尺寸对齐 + 严格背景过滤 + HWC转CHW维度适配
     """
 
     def __init__(self, target_path, device='cuda'):
@@ -41,77 +42,54 @@ class StainNormTransform(object):
 
         self.device = torch.device(device) if torch.cuda.is_available() else torch.device('cpu')
 
-        # 初始化 Normalizer
-        # 注意：这里我们 fit 时就使用目标设备，避免后续频繁的数据搬运
-        target_tensor = torch.from_numpy(target).to(self.device)
+        # [关键] 参考图也必须转为 (C, H, W) 格式
+        # target shape: (H, W, C) -> (C, H, W)
+        target_tensor = torch.from_numpy(target).permute(2, 0, 1).to(self.device)
+
         self.normalizer = torchstain.normalizers.MacenkoNormalizer(backend='torch')
         self.normalizer.fit(target_tensor)
 
-    def is_tissue_sufficient(self, img_np):
-        """
-        更严格的组织检测：直接基于光密度 (OD) 检查
-        Macenko 算法内部使用 OD > 0.15 作为阈值。
-        如果满足该阈值的像素太少，SVD 必然失败。
-        """
-        # 1. 基础灰度过滤 (保留你原有的逻辑，作为第一道防线)
+    def is_background(self, img_np):
+        """基于严格阈值的背景检测"""
         img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-        if np.mean(img_gray) > 220: return False  # 太亮
+        mean_val = np.mean(img_gray)
+        if mean_val > 210:  # 亮度阈值
+            return True
         white_ratio = np.sum(img_gray > 210) / img_gray.size
-        if white_ratio > 0.60: return False  # 背景太多 (放宽到60%，交给后面OD判断)
-        if np.std(img_gray) < 10: return False  # 对比度太低
-
-        # 2. 光密度 (OD) 预检查 (核心修复)
-        # 模拟 Macenko 的转换: OD = -log((I+1)/I_0)
-        # 简单快速估算：只看 G 通道或亮度即可，或者取反
-        # 这里为了速度，我们直接计算 img_np 中非白色区域的比例
-
-        # 将 RGB 转为 Tensor 计算 OD 会比较慢，我们用 Numpy 近似检查
-        # 避免 Log(0) 错误，加 1
-        img_float = img_np.astype(np.float32) + 1
-        # 计算 OD: -log10(I / 255)
-        # 实际上只要判断有多少像素显著暗于背景即可
-        # 设定一个严格的 Mask：只有当像素确实有颜色时才算数
-
-        # 检查是否存在太多的纯白或接近纯白像素
-        # 在 RGB 空间，三个通道都大于 220 认为是背景
-        is_background = np.all(img_np > 220, axis=-1)
-        tissue_ratio = 1.0 - (np.sum(is_background) / is_background.size)
-
-        # 如果组织占比小于 5% (根据 patch 大小调整)，直接认为无法进行染色归一化
-        # 224x224 的 5% 大约是 2500 个像素，足够计算 SVD
-        if tissue_ratio < 0.05:
-            return False
-
-        return True
+        if white_ratio > 0.70:  # 白色占比阈值
+            return True
+        return False
 
     def __call__(self, img):
         try:
-            # --- 1. 强制尺寸对齐 (修复边缘 Patch 尺寸不一致问题) ---
-            # 无论 OpenSlide 读出 256x256 还是边缘的 256x200
-            # 都在进入算法前强制缩放到 224x224
+            # 1. 强制尺寸对齐
             if img.size != (224, 224):
                 img = img.resize((224, 224), Image.BICUBIC)
-            # --------------------------------------------------
 
             img_np = np.array(img)
 
-            # --- 2. 强力背景过滤 ---
-            if np.mean(cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)) > 210:
+            # 2. 强力背景过滤
+            if self.is_background(img_np):
                 return img
 
-            # --- 3. Macenko 标准化 ---
-            img_tensor = torch.from_numpy(img_np).to(device)  # 确保使用全局定义的 device
+            # 3. Macenko 标准化 (维度修复核心)
+            # numpy (H, W, C) -> tensor (H, W, C) -> permute (C, H, W)
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).to(self.device)
 
+            # normalize 返回的是 (norm, H, E) 或者 norm，视版本而定
+            # 加上 stains=False 通常只返回归一化后的图
             norm, _, _ = self.normalizer.normalize(I=img_tensor, stains=False)
 
+            # 4. 结果转回
             if isinstance(norm, torch.Tensor):
-                norm = norm.cpu().numpy()
+                # (C, H, W) -> permute (H, W, C) -> cpu -> numpy
+                norm = norm.permute(1, 2, 0).cpu().numpy()
 
             norm = norm.astype(np.uint8)
             return Image.fromarray(norm)
 
         except Exception as e:
-            # 兜底：如果报错，返回 resize 后的原图，保证后续模型不崩
+            # 兜底：返回 Resize 后的原图
             if img.size != (224, 224):
                 img = img.resize((224, 224), Image.BICUBIC)
             return img
