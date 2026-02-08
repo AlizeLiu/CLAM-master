@@ -29,8 +29,8 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 class StainNormTransform(object):
     """
-    Macenko 染色标准化 Transform (最终维度修复版)
-    集成: 强制尺寸对齐 + 严格背景过滤 + HWC转CHW维度适配
+    Macenko 染色标准化 Transform (完美适配版)
+    逻辑：输入转CHW -> 算法 -> 输出自动为HWC -> 无需再转
     """
 
     def __init__(self, target_path, device='cuda'):
@@ -40,23 +40,21 @@ class StainNormTransform(object):
             raise ValueError(f"Could not read reference image at {target_path}")
         target = cv2.cvtColor(target, cv2.COLOR_BGR2RGB)
 
+        # 优先检测环境
         self.device = torch.device(device) if torch.cuda.is_available() else torch.device('cpu')
 
-        # [关键] 参考图也必须转为 (C, H, W) 格式
-        # target shape: (H, W, C) -> (C, H, W)
+        # [输入] 参考图必须转为 (C, H, W) 才能正确 fit
         target_tensor = torch.from_numpy(target).permute(2, 0, 1).to(self.device)
 
         self.normalizer = torchstain.normalizers.MacenkoNormalizer(backend='torch')
         self.normalizer.fit(target_tensor)
 
     def is_background(self, img_np):
-        """基于严格阈值的背景检测"""
+        """背景检测 (Mean > 210)"""
         img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-        mean_val = np.mean(img_gray)
-        if mean_val > 210:  # 亮度阈值
+        if np.mean(img_gray) > 210:
             return True
-        white_ratio = np.sum(img_gray > 210) / img_gray.size
-        if white_ratio > 0.70:  # 白色占比阈值
+        if (np.sum(img_gray > 210) / img_gray.size) > 0.70:
             return True
         return False
 
@@ -68,28 +66,27 @@ class StainNormTransform(object):
 
             img_np = np.array(img)
 
-            # 2. 强力背景过滤
+            # 2. 背景过滤
             if self.is_background(img_np):
                 return img
 
-            # 3. Macenko 标准化 (维度修复核心)
-            # numpy (H, W, C) -> tensor (H, W, C) -> permute (C, H, W)
+            # 3. 标准化
+            # [关键] 输入必须是 (C, H, W)
             img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).to(self.device)
 
-            # normalize 返回的是 (norm, H, E) 或者 norm，视版本而定
-            # 加上 stains=False 通常只返回归一化后的图
+            # normalize 返回的结果，经测试已经是 (H, W, C) 了！
             norm, _, _ = self.normalizer.normalize(I=img_tensor, stains=False)
 
-            # 4. 结果转回
+            # 4. 结果处理
             if isinstance(norm, torch.Tensor):
-                # (C, H, W) -> permute (H, W, C) -> cpu -> numpy
-                norm = norm.permute(1, 2, 0).cpu().numpy()
+                # [关键修正] 不需要 permute(1,2,0)，直接转 cpu 即可
+                norm = norm.cpu().numpy()
 
             norm = norm.astype(np.uint8)
             return Image.fromarray(norm)
 
         except Exception as e:
-            # 兜底：返回 Resize 后的原图
+            # 兜底
             if img.size != (224, 224):
                 img = img.resize((224, 224), Image.BICUBIC)
             return img
