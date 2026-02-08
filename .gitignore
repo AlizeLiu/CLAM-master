@@ -1,5 +1,7 @@
 toy_example/
 toy_test/
+normalization_check
+macenko_simple
+.idea
 *.svs
 *.pth
-读取h5.py

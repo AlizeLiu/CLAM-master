@@ -11,7 +11,8 @@ from timm.data import resolve_data_config, create_transform
 from timm.layers import SwiGLUPacked
 from torch.utils.data import DataLoader
 from PIL import Image
-import torchstain
+import torchstain  # 必须安装: pip install torchstain
+import cv2  # 必须安装: pip install opencv-python
 import h5py
 import openslide
 from tqdm import tqdm
@@ -24,6 +25,96 @@ from timm.models import create_model
 # 注意：如果 get_encoder 报错，我们可以直接在这里定义 Virchow 加载逻辑
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+
+class StainNormTransform(object):
+    """
+    Macenko 染色标准化 Transform (修复 MKL 崩溃版)
+    """
+
+    def __init__(self, target_path, device='cuda'):
+        print(f"Initializing Macenko Normalizer with reference: {target_path}")
+        target = cv2.imread(target_path)
+        if target is None:
+            raise ValueError(f"Could not read reference image at {target_path}")
+        target = cv2.cvtColor(target, cv2.COLOR_BGR2RGB)
+
+        self.device = torch.device(device) if torch.cuda.is_available() else torch.device('cpu')
+
+        # 初始化 Normalizer
+        # 注意：这里我们 fit 时就使用目标设备，避免后续频繁的数据搬运
+        target_tensor = torch.from_numpy(target).to(self.device)
+        self.normalizer = torchstain.normalizers.MacenkoNormalizer(backend='torch')
+        self.normalizer.fit(target_tensor)
+
+    def is_tissue_sufficient(self, img_np):
+        """
+        更严格的组织检测：直接基于光密度 (OD) 检查
+        Macenko 算法内部使用 OD > 0.15 作为阈值。
+        如果满足该阈值的像素太少，SVD 必然失败。
+        """
+        # 1. 基础灰度过滤 (保留你原有的逻辑，作为第一道防线)
+        img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        if np.mean(img_gray) > 220: return False  # 太亮
+        white_ratio = np.sum(img_gray > 210) / img_gray.size
+        if white_ratio > 0.60: return False  # 背景太多 (放宽到60%，交给后面OD判断)
+        if np.std(img_gray) < 10: return False  # 对比度太低
+
+        # 2. 光密度 (OD) 预检查 (核心修复)
+        # 模拟 Macenko 的转换: OD = -log((I+1)/I_0)
+        # 简单快速估算：只看 G 通道或亮度即可，或者取反
+        # 这里为了速度，我们直接计算 img_np 中非白色区域的比例
+
+        # 将 RGB 转为 Tensor 计算 OD 会比较慢，我们用 Numpy 近似检查
+        # 避免 Log(0) 错误，加 1
+        img_float = img_np.astype(np.float32) + 1
+        # 计算 OD: -log10(I / 255)
+        # 实际上只要判断有多少像素显著暗于背景即可
+        # 设定一个严格的 Mask：只有当像素确实有颜色时才算数
+
+        # 检查是否存在太多的纯白或接近纯白像素
+        # 在 RGB 空间，三个通道都大于 220 认为是背景
+        is_background = np.all(img_np > 220, axis=-1)
+        tissue_ratio = 1.0 - (np.sum(is_background) / is_background.size)
+
+        # 如果组织占比小于 5% (根据 patch 大小调整)，直接认为无法进行染色归一化
+        # 224x224 的 5% 大约是 2500 个像素，足够计算 SVD
+        if tissue_ratio < 0.05:
+            return False
+
+        return True
+
+    def __call__(self, img):
+        try:
+            # --- 1. 强制尺寸对齐 (修复边缘 Patch 尺寸不一致问题) ---
+            # 无论 OpenSlide 读出 256x256 还是边缘的 256x200
+            # 都在进入算法前强制缩放到 224x224
+            if img.size != (224, 224):
+                img = img.resize((224, 224), Image.BICUBIC)
+            # --------------------------------------------------
+
+            img_np = np.array(img)
+
+            # --- 2. 强力背景过滤 ---
+            if np.mean(cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)) > 210:
+                return img
+
+            # --- 3. Macenko 标准化 ---
+            img_tensor = torch.from_numpy(img_np).to(device)  # 确保使用全局定义的 device
+
+            norm, _, _ = self.normalizer.normalize(I=img_tensor, stains=False)
+
+            if isinstance(norm, torch.Tensor):
+                norm = norm.cpu().numpy()
+
+            norm = norm.astype(np.uint8)
+            return Image.fromarray(norm)
+
+        except Exception as e:
+            # 兜底：如果报错，返回 resize 后的原图，保证后续模型不崩
+            if img.size != (224, 224):
+                img = img.resize((224, 224), Image.BICUBIC)
+            return img
 
 
 def compute_w_loader(output_path, loader, model, model_name, verbose=0):
@@ -100,6 +191,7 @@ def load_prov_giga_path():
     print("Prov-GigaPath model and transforms initialized successfully.")
     return model, img_transforms
 
+
 def load_uni():
     print("Loading MahmoodLab UNI using Official Configuration...")
     # 按照官方文档：必须传 init_values=1e-5 才能正确加载 LayerScale 参数
@@ -149,7 +241,6 @@ def load_h_optimus():
     return model, img_transforms
 
 
-
 parser = argparse.ArgumentParser(description='Feature Extraction')
 parser.add_argument('--data_h5_dir', type=str, default=None)
 parser.add_argument('--data_slide_dir', type=str, default=None)
@@ -158,10 +249,15 @@ parser.add_argument('--csv_path', type=str, default=None)
 parser.add_argument('--feat_dir', type=str, default=None)
 # 增加 virchow 选项
 parser.add_argument('--model_name', type=str, default='resnet50_trunc',
-                    choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'virchow','Prov-GigaPath','h-optimus-0'])
+                    choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'virchow', 'Prov-GigaPath', 'h-optimus-0'])
 parser.add_argument('--batch_size', type=int, default=128)  # 建议先从 128 开始试
 parser.add_argument('--no_auto_skip', default=False, action='store_true')
 parser.add_argument('--target_patch_size', type=int, default=224)
+
+# --- 新增参数：染色标准化参考图 ---
+parser.add_argument('--target_ref', type=str, default=None,
+                    help='Path to the reference image for Macenko normalization. If None, normalization is skipped.')
+
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -192,8 +288,33 @@ if __name__ == '__main__':
         model, img_transforms = get_encoder(args.model_name, target_img_size=args.target_patch_size)
         model = model.to(device)
 
+    # --- 4. 插入染色标准化逻辑 ---
+    if args.target_ref is not None:
+        print(f"\n[INFO] Enabling Macenko Stain Normalization...")
+        if not os.path.exists(args.target_ref):
+            raise FileNotFoundError(f"Reference image not found at {args.target_ref}")
+
+        # 实例化自定义的 Normalizer
+        stain_norm = StainNormTransform(args.target_ref)
+
+        # 将 Normalizer 插入到现有的 Transform 序列的最前端
+        # 确保顺序：Raw Image (PIL) -> Stain Norm -> Resize/ToTensor/Normalize
+        if isinstance(img_transforms, transforms.Compose):
+            # 如果是 Compose 对象，拆开 list 插在最前面
+            new_transforms_list = [stain_norm] + img_transforms.transforms
+            img_transforms = transforms.Compose(new_transforms_list)
+        else:
+            # 如果是单个 Transform 或者 Sequential，直接打包
+            img_transforms = transforms.Compose([stain_norm, img_transforms])
+
+        print("[INFO] Transforms updated with Stain Normalization.")
+    else:
+        print("\n[INFO] Skipping Stain Normalization (no target_ref provided).")
+    # ---------------------------
+
     model.eval()
     total = len(bags_dataset)
+    # 染色标准化计算量大，建议 num_workers 保持 0 或较小值以防内存溢出，或者根据 CPU 核心数调整
     loader_kwargs = {'num_workers': 0, 'pin_memory': True} if device.type == "cuda" else {}
 
     # --- 计数器逻辑 ---
@@ -223,11 +344,20 @@ if __name__ == '__main__':
         h5_file_path = os.path.join(args.data_h5_dir, 'patches', bag_name)
         slide_file_path = os.path.join(args.data_slide_dir, slide_id + args.slide_ext)
 
+        # 检查文件是否存在
+        if not os.path.exists(h5_file_path):
+            print(f"跳过 {slide_id}: 未找到 patch h5 文件")
+            continue
+        if not os.path.exists(slide_file_path):
+            print(f"跳过 {slide_id}: 未找到 slide 文件")
+            continue
+
         output_path = os.path.join(args.feat_dir, 'h5_files', bag_name)
         time_start = time.time()
 
         try:
             wsi = openslide.open_slide(slide_file_path)
+            # 使用包含 StainNorm 的 img_transforms 初始化 Dataset
             dataset = Whole_Slide_Bag_FP(file_path=h5_file_path, wsi=wsi, img_transforms=img_transforms)
             loader = DataLoader(dataset=dataset, batch_size=args.batch_size, **loader_kwargs)
 
