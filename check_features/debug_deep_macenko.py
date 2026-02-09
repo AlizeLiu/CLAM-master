@@ -78,9 +78,9 @@ def debug_deep_final():
         print(f"   平均像素差异 (MAE): {mae:.4f}")
 
         if mae > 1.0:
-            print("\n🎉 成功！标准化生效！现在可以放心跑主程序了。")
+            print("\n成功！标准化生效！")
         else:
-            print("\n⚠️ 警告：变化极小，可能是参考图风格太接近。")
+            print("\n警告：变化极小。")
 
     except Exception as e:
         print(f"\n❌ 报错: {e}")
