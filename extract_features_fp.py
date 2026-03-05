@@ -1,5 +1,8 @@
 import time
 import os
+
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 import argparse
 from functools import partial
 
@@ -37,21 +40,27 @@ def compute_w_loader(output_path, loader, model, model_name, verbose=0):
             coords = data['coord'].numpy().astype(np.int32)
 
             with torch.autocast(device_type='cuda', dtype=torch.float16):
-                output = model(batch)
-
-                if model_name == 'virchow':
-                    # Virchow 特殊处理 (2560维)
-                    class_token = output[:, 0]
-                    patch_tokens = output[:, 1:]
-                    features = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
-                elif model_name in ['uni_v1', 'UNI', 'h-optimus-0']:
-                    # UNI 和 H-optimus-0 官方输出直接就是 [B, 1024/1536]
-                    features = output
-                elif model_name == 'Prov-GigaPath':
-                    features = output[:, 0] if len(output.shape) == 3 else output
+                if model_name == 'phikon-v2':
+                    output = model(pixel_values=batch)
+                    # DINOv2 风格：提取第 0 个位置的 CLS Token 作为全局特征 (B, 1024)
+                    features = output.last_hidden_state[:, 0, :]
                 else:
-                    features = output
+                    # 其他 timm 模型的通用前向传播
+                    output = model(batch)
 
+                    # 针对不同模型的特征提取逻辑
+                    if model_name == 'virchow':
+                        # Virchow 特殊处理 (2560维)
+                        class_token = output[:, 0]
+                        patch_tokens = output[:, 1:]
+                        features = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
+                    elif model_name in ['uni_v1', 'UNI', 'h-optimus-0']:
+                        # UNI 和 H-optimus-0 官方输出直接就是 [B, 1024/1536]
+                        features = output
+                    elif model_name == 'Prov-GigaPath':
+                        features = output[:, 0] if len(output.shape) == 3 else output
+                    else:
+                        features = output
             features = features.cpu().numpy().astype(np.float32)
             asset_dict = {'features': features, 'coords': coords}
             save_hdf5(output_path, asset_dict, attr_dict=None, mode=mode)
@@ -149,6 +158,35 @@ def load_h_optimus():
     return model, img_transforms
 
 
+def load_phikon_v2():
+    print("Loading Owkin Phikon-v2 using Transformers...")
+    # 注意：Phikon 官方推荐使用 transformers 库加载
+    from transformers import AutoModel, AutoImageProcessor
+    from torchvision import transforms
+
+    model = AutoModel.from_pretrained("owkin/phikon-v2")
+    model = model.to(device)
+    model.eval()
+
+    # 获取官方推荐的预处理参数 (通常是 224 尺寸，ImageNet均值方差)
+    processor = AutoImageProcessor.from_pretrained("owkin/phikon-v2")
+
+    # 手动转换为你现有的 torchvision 数据流规范
+    img_transforms = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=processor.image_mean,
+            std=processor.image_std
+        )
+    ])
+
+    print("Phikon-v2 model and transforms initialized successfully.")
+    # Phikon-v2 (ViT-L) 的特征维度是 1024
+    return model, img_transforms
+
+
 
 parser = argparse.ArgumentParser(description='Feature Extraction')
 parser.add_argument('--data_h5_dir', type=str, default=None)
@@ -156,10 +194,9 @@ parser.add_argument('--data_slide_dir', type=str, default=None)
 parser.add_argument('--slide_ext', type=str, default='.svs')
 parser.add_argument('--csv_path', type=str, default=None)
 parser.add_argument('--feat_dir', type=str, default=None)
-# 增加 virchow 选项
 parser.add_argument('--model_name', type=str, default='resnet50_trunc',
-                    choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'virchow','Prov-GigaPath','h-optimus-0'])
-parser.add_argument('--batch_size', type=int, default=128)  # 建议先从 128 开始试
+                    choices=['resnet50_trunc', 'uni_v1', 'conch_v1', 'virchow','Prov-GigaPath','h-optimus-0', 'phikon-v2'])
+parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--no_auto_skip', default=False, action='store_true')
 parser.add_argument('--target_patch_size', type=int, default=224)
 args = parser.parse_args()
@@ -186,6 +223,8 @@ if __name__ == '__main__':
         model, img_transforms = load_h_optimus()
     elif args.model_name == 'uni_v1' or args.model_name == 'UNI':
         model, img_transforms = load_uni()
+    elif args.model_name == 'phikon-v2':
+        model, img_transforms = load_phikon_v2()
     else:
         from models import get_encoder
 

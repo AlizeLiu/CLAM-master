@@ -5,7 +5,7 @@ import argparse
 
 # ================= 配置区域 =================
 # 修改此处，或者通过命令行参数传入 --dir
-DEFAULT_PT_PATH = r'E:\glptc\toy_test\feature_uni\pt_files'
+DEFAULT_PT_PATH = r'J:\Work\CLAM-master\toy_test\feature_univ1\pt_files'
 EXPECTED_DIM = 1024  # 固定UNI_v1 的特征维度
 
 
