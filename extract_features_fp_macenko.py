@@ -110,6 +110,9 @@ def compute_w_loader(output_path, loader, model, model_name, verbose=0):
                     class_token = output[:, 0]
                     patch_tokens = output[:, 1:]
                     features = torch.cat([class_token, patch_tokens.mean(1)], dim=-1)
+                elif model_name == 'conch_v1':
+                    # CONCH 专为 MIL 任务提取底层语义特征（关闭投影和归一化）
+                    features = model.encode_image(batch, proj_contrast=False, normalize=False)
                 elif model_name in ['uni_v1', 'UNI', 'h-optimus-0']:
                     # UNI 和 H-optimus-0 官方输出直接就是 [B, 1024/1536]
                     features = output
@@ -216,6 +219,32 @@ def load_h_optimus():
     return model, img_transforms
 
 
+def load_conch():
+    print("Loading MahmoodLab CONCH using Official Configuration...")
+    try:
+        from conch.open_clip_custom import create_model_from_pretrained
+    except ImportError:
+        raise ImportError("请先安装 CONCH: pip install git+https://github.com/Mahmoodlab/CONCH.git")
+
+    # CONCH 权重在 HuggingFace 上是 Gated 状态，必须验证 Token
+    token = os.environ.get("HF_TOKEN", None)
+    if token is None:
+        print("[Warning] 未检测到 HF_TOKEN 环境变量。如果在加载时遇到权限错误，请确保已设置 HuggingFace Token。")
+
+    model, img_transforms = create_model_from_pretrained(
+        'conch_ViT-B-16',
+        "hf_hub:MahmoodLab/conch",
+        hf_auth_token=token
+    )
+
+    model = model.to(device)
+    model.eval()
+
+    print("CONCH model and transforms initialized successfully.")
+    # CONCH (ViT-B-16) 输出特征维度为 512
+    return model, img_transforms
+
+
 parser = argparse.ArgumentParser(description='Feature Extraction')
 parser.add_argument('--data_h5_dir', type=str, default=None)
 parser.add_argument('--data_slide_dir', type=str, default=None)
@@ -257,6 +286,8 @@ if __name__ == '__main__':
         model, img_transforms = load_h_optimus()
     elif args.model_name == 'uni_v1' or args.model_name == 'UNI':
         model, img_transforms = load_uni()
+    elif args.model_name == 'conch':
+        model, img_transforms = load_conch()
     else:
         from models import get_encoder
 
